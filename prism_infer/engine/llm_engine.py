@@ -1,0 +1,129 @@
+import atexit                           # atexit.register: 注册进程退出时的清理函数(类似C++ std::atexit)
+from dataclasses import fields          # fields(Config): 获取dataclass的所有字段信息
+from time import perf_counter           # 高精度计时(类似C++ chrono::high_resolution_clock)
+from tqdm.auto import tqdm              # 进度条库, auto版本自动适配终端/Jupyter
+from transformers import AutoTokenizer  # HuggingFace分词器: 文本↔token_ids
+import torch.multiprocessing as mp      # PyTorch多进程模块(比标准multiprocessing多CUDA tensor共享支持)
+
+from prism_infer.config import Config
+from prism_infer.sampling_params import SamplingParams
+from prism_infer.engine.sequence import Sequence
+from prism_infer.engine.scheduler import Scheduler
+from prism_infer.engine.model_runner import ModelRunner
+
+
+class LLMEngine:
+    """推理引擎主控: 管理多进程、调度、主循环
+    用户通过LLM(继承自LLMEngine)使用, 所有核心逻辑都在这里
+    """
+
+    def __init__(self, model, **kwargs):
+        # --- 参数过滤: 只保留Config认识的参数, 忽略其他 ---
+        config_fields = {field.name for field in fields(Config)}  # Config的所有字段名集合
+        config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}  # 过滤
+        config = Config(model, **config_kwargs)  # 创建配置(触发__post_init__校验)
+
+        # --- 多进程TP初始化 ---
+        self.ps = []        # 子进程列表
+        self.events = []    # 跨进程同步事件列表(类似C++ condition_variable)
+        ctx = mp.get_context("spawn")  # spawn模式: 新建Python解释器(fork对CUDA不安全)
+        # 创建子进程: rank=1,2,...,N-1 分别在GPU1,2,...,N-1上运行
+        for i in range(1, config.tensor_parallel_size):
+            event = ctx.Event()         # 跨进程同步信号量
+            process = ctx.Process(target=ModelRunner, args=(config, i, event))  # 子进程入口=ModelRunner(含无限循环)
+            process.start()
+            self.ps.append(process)
+            self.events.append(event)
+        # 主进程自己也创建ModelRunner: rank=0, 在GPU0上运行
+        self.model_runner = ModelRunner(config, 0, self.events)
+
+        # --- Tokenizer + Scheduler ---
+        self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)  # 分词器(只在主进程)
+        config.eos = self.tokenizer.eos_token_id  # 从tokenizer获取EOS token id(Config创建时还不知道)
+        self.scheduler = Scheduler(config)  # 调度器
+        atexit.register(self.exit)  # 注册退出清理函数(类似RAII析构+atexit)
+
+    def exit(self):
+        """清理: 通知子进程退出, 释放GPU资源, 等待子进程结束"""
+        self.model_runner.call("exit")  # 通过IPC通知所有子进程退出无限循环
+        del self.model_runner            # 释放主进程的ModelRunner(含GPU资源)
+        for p in self.ps:
+            p.join()                     # 等待所有子进程退出(类似C++ thread.join)
+
+    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
+        """添加一条推理请求: 文本→tokenize→创建Sequence→加入调度队列"""
+        if isinstance(prompt, str):
+            prompt = self.tokenizer.encode(prompt)  # 文本→token_ids
+        seq = Sequence(prompt, sampling_params)      # 创建序列对象
+        self.scheduler.add(seq)                      # 加入scheduler.waiting队列
+
+    def step(self):
+        """执行一步推理(一次完整的 调度→推理→后处理 循环)
+        返回: (已完成的序列列表, num_tokens)
+        num_tokens > 0 表示prefill(值=总token数), < 0 表示decode(值=-批次大小)
+        """
+        seqs, is_prefill, cow_pairs, swap_in_map, swap_out_map = self.scheduler.schedule()  # 1. 调度
+        # 1.5 CoW: 在 GPU 上复制共享 block 的 KV 数据
+        if cow_pairs:
+            self.model_runner.call("copy_kv_blocks", cow_pairs)
+        # 1.6 Swap: GPU ↔ CPU KV Cache 数据搬运
+        if swap_out_map:
+            self.model_runner.call("swap_blocks", swap_out_map, "out")
+        if swap_in_map:
+            self.model_runner.call("swap_blocks", swap_in_map, "in")
+        token_ids = self.model_runner.call("run", seqs, is_prefill)  # 2. GPU推理: 返回每条seq的新token
+        self.scheduler.postprocess(seqs, token_ids)          # 3. 后处理: 追加token, 检查是否结束
+        # 收集已完成的序列
+        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+        # num_tokens正负编码: 正=prefill总token数, 负=-decode批次大小(用于吞吐量计算)
+        num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
+        return outputs, num_tokens
+
+    def is_finished(self):
+        """所有请求是否处理完毕(waiting和running都为空)"""
+        return self.scheduler.is_finished()
+
+    def generate(
+        self,
+        prompts: list[str] | list[list[int]],          # 输入: 字符串列表或token_id列表的列表
+        sampling_params: SamplingParams | list[SamplingParams],  # 采样参数: 单个(所有请求共用)或列表
+        use_tqdm: bool = True,                          # 是否显示进度条
+    ) -> list[str]:
+        """对外公开接口: 批量输入prompt, 返回生成结果"""
+        if use_tqdm:
+            pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True)
+        # 如果sampling_params不是列表, 复制N份(所有请求共用同一参数)
+        if not isinstance(sampling_params, list):
+            sampling_params = [sampling_params] * len(prompts)
+        # 逐个添加请求到调度队列
+        for prompt, sp in zip(prompts, sampling_params):
+            self.add_request(prompt, sp)
+
+        # --- 主推理循环 ---
+        outputs = {}                                   # {seq_id: completion_token_ids}
+        prefill_throughput = decode_throughput = 0.
+        while not self.is_finished():
+            t = perf_counter()                         # 计时开始
+            output, num_tokens = self.step()            # 执行一步推理
+            # 更新吞吐量统计(进度条显示用)
+            if use_tqdm:
+                if num_tokens > 0:  # prefill
+                    prefill_throughput = num_tokens / (perf_counter() - t)  # tokens/sec
+                else:               # decode
+                    decode_throughput = -num_tokens / (perf_counter() - t)  # tokens/sec
+                pbar.set_postfix({
+                    "Prefill": f"{int(prefill_throughput)}tok/s",
+                    "Decode": f"{int(decode_throughput)}tok/s",
+                })
+            # 收集本步完成的序列
+            for seq_id, token_ids in output:
+                outputs[seq_id] = token_ids
+                if use_tqdm:
+                    pbar.update(1)  # 进度条+1(每完成一条序列, 不是每步+1)
+
+        # --- 结果整理 ---
+        outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]  # 按seq_id排序, 保证与输入顺序一致
+        outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]  # token_ids→文本
+        if use_tqdm:
+            pbar.close()
+        return outputs  # 返回: [{"text": "...", "token_ids": [...]}, ...]
